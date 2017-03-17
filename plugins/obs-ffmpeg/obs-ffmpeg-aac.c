@@ -33,6 +33,9 @@
 #define info(format, ...)  do_log(LOG_INFO,    format, ##__VA_ARGS__)
 #define debug(format, ...) do_log(LOG_DEBUG,   format, ##__VA_ARGS__)
 
+#define ENABLE_AMBISONIC_ENCODING		1
+
+
 struct aac_encoder {
 	obs_encoder_t    *encoder;
 
@@ -51,6 +54,44 @@ struct aac_encoder {
 	int              frame_size; /* pretty much always 1024 for AAC */
 	int              frame_size_bytes;
 };
+
+#if ENABLE_AMBISONIC_ENCODING
+struct ambix_info {
+	float sin_theta, sin_phi;
+	float cos_theta, cos_phi;
+};
+struct ambix_info ambix_chan_info[MAX_AV_PLANES];
+
+static bool ambisonic_encode(struct encoder_frame *frame, struct aac_encoder *enc)
+{
+	audio_t            *audio = obs_encoder_audio(enc->encoder);
+	int numchannels = (int)audio_output_get_channels(audio);
+	float *enc_samples0 = (float *)enc->samples[0];
+	float *enc_samples1 = (float *)enc->samples[1];
+	float *enc_samples2 = (float *)enc->samples[2];
+	float *enc_samples3 = (float *)enc->samples[3];
+	memset(enc->samples[0], 0, enc->frame_size_bytes);
+	memset(enc->samples[1], 0, enc->frame_size_bytes);
+	memset(enc->samples[2], 0, enc->frame_size_bytes);
+	memset(enc->samples[3], 0, enc->frame_size_bytes);
+	for (size_t i = 0; i < numchannels; i++){
+		float mulfac = (1.f / sqrt(2.f));
+		float *src = (float*)frame->data[i];
+		float cos_theta = ambix_chan_info[i].cos_theta;
+		float cos_phi = ambix_chan_info[i].cos_phi;
+		float sin_theta = ambix_chan_info[i].sin_theta;
+		float sin_phi = ambix_chan_info[i].sin_phi;
+		for (size_t n = 0; n < enc->frame_size; n++){
+			enc_samples0[n] += mulfac * src[n];				//W
+			enc_samples1[n] += sin_theta*cos_phi * src[n];	//Y
+			enc_samples2[n] += sin_phi * src[n];			//Z
+			enc_samples3[n] += cos_theta*cos_phi * src[n];	//X
+		}
+	}
+	return true;
+}
+#endif
+
 
 static const char *aac_getname(void *unused)
 {
@@ -101,7 +142,28 @@ static bool initialize_codec(struct aac_encoder *enc)
 		warn("Failed to create audio buffer: %s", av_err2str(ret));
 		return false;
 	}
+#if ENABLE_AMBISONIC_ENCODING
+	// open ambix config file for phi and and theta and init ambix channel info
+	FILE *fp = fopen("/tmp/ambix_info.txt", "r");
 
+	if (fp){
+		blog(LOG_INFO, "FSK: OPENED ambix_info.txt file ---------------------------------");
+		float mulfactor = 3.1415926535f / 180.0f;
+		for (int i = 0; i < MAX_AV_PLANES; i++){
+			float theta, phi;
+			if (fscanf(fp, "%f %f", &theta, &phi) != 2)
+				break;
+			ambix_chan_info[i].sin_theta = sinf(theta*mulfactor);
+			ambix_chan_info[i].sin_phi = sinf(phi*mulfactor);
+			ambix_chan_info[i].cos_theta = sinf(theta*mulfactor);
+			ambix_chan_info[i].cos_phi = sinf(phi*mulfactor);
+		}
+	}
+	else {
+		blog(LOG_INFO, "FSK: DID NOT OPENED  ambix_info.txt file ---------------------------------");
+	}
+	fclose(fp);
+#endif
 	return true;
 }
 
@@ -152,7 +214,12 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 	}
 
 	enc->context->bit_rate    = bitrate * 1000;
-	enc->context->channels    = (int)audio_output_get_channels(audio);
+#if ENABLE_AMBISONIC_ENCODING
+	enc->context->channels = 4;
+	enc->context->channel_layout = AV_CH_LAYOUT_4POINT0;
+#else
+	enc->context->channels = (int)audio_output_get_channels(audio);
+#endif
 	enc->context->sample_rate = audio_output_get_sample_rate(audio);
 	enc->context->sample_fmt  = enc->aac->sample_fmts ?
 		enc->aac->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
@@ -182,7 +249,6 @@ static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 
 	if (initialize_codec(enc))
 		return enc;
-
 fail:
 	aac_destroy(enc);
 	return NULL;
@@ -240,9 +306,12 @@ static bool aac_encode(void *data, struct encoder_frame *frame,
 		struct encoder_packet *packet, bool *received_packet)
 {
 	struct aac_encoder *enc = data;
-
+#if ENABLE_AMBISONIC_ENCODING
+	ambisonic_encode(frame, enc);
+#else
 	for (size_t i = 0; i < enc->audio_planes; i++)
 		memcpy(enc->samples[i], frame->data[i], enc->frame_size_bytes);
+#endif
 
 	return do_aac_encode(enc, packet, received_packet);
 }
